@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Voice Chat</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 50px; background: #f0f0f0; }
+        #status { font-weight: bold; margin: 20px 0; padding: 10px; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .danger { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Basic WebRTC Voice Chat</h1>
+    <div id="status" class="info">Click Connect to start the mic and connect.</div>
+    <button id="connectBtn">Connect</button>
+
+    <p style="margin-top: 30px;">
+        To test: Open this page in two separate browser tabs or on two different devices.
+    </p>
+
+    <audio id="remoteAudio" autoplay></audio> 
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        // *** RENDER DEPLOYMENT NOTE ***
+        // 1. Once deployed, change this URL to your Render service's public HTTPS URL.
+        // 2. For local testing, use the commented out line.
+        const SOCKET_SERVER_URL = 'http://localhost:3000'; // Change this to your Render URL: e.g., 'https://my-voice-chat-app.onrender.com'
+        
+        // --- WebRTC Configuration (Using public Google STUN servers) ---
+        const peerConnectionConfig = {
+            'iceServers': [
+                { 'urls': 'stun:stun.l.google.com:19302' },
+                { 'urls': 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        let localStream = null;
+        let peerConnection = null;
+        let isInitiator = false; // Flag to determine who starts the connection
+
+        const statusDiv = document.getElementById('status');
+        const connectBtn = document.getElementById('connectBtn');
+        const remoteAudio = document.getElementById('remoteAudio');
+
+        // Initialize Socket.io connection
+        const socket = io(SOCKET_SERVER_URL);
+
+        // --- UI and Status Updates ---
+        function setStatus(message, className = 'info') {
+            statusDiv.textContent = message;
+            statusDiv.className = '';
+            statusDiv.classList.add(className);
+        }
+
+        connectBtn.onclick = startConnection;
+
+        // --- Core Functions ---
+
+        async function startConnection() {
+            connectBtn.disabled = true;
+            setStatus('Requesting microphone access...', 'info');
+
+            try {
+                // Get microphone access (audio only)
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                setStatus('Microphone access granted. Waiting for another peer...', 'success');
+                
+                // Start the signaling process
+                initPeerConnection();
+
+            } catch (err) {
+                console.error("Error accessing media devices: ", err);
+                setStatus(`ERROR: Could not get microphone: ${err.name}`, 'danger');
+                connectBtn.disabled = false;
+            }
+        }
+
+        function initPeerConnection() {
+            // 1. Create a new Peer Connection
+            peerConnection = new RTCPeerConnection(peerConnectionConfig);
+
+            // 2. Add local stream tracks to the connection
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+
+            // 3. Handle ICE Candidates (network information)
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    // Send the ICE candidate over the signaling server
+                    socket.emit('signal', { 'ice': event.candidate });
+                }
+            };
+
+            // 4. Handle incoming remote stream/tracks
+            peerConnection.ontrack = (event) => {
+                // Attach the remote audio stream to the HTML audio element
+                if (remoteAudio.srcObject !== event.streams[0]) {
+                    remoteAudio.srcObject = event.streams[0];
+                    setStatus('Voice chat established! You are connected.', 'success');
+                }
+            };
+            
+            // 5. Check if we are the first peer (Initiator)
+            // The 'negotiationneeded' event fires when the browser determines a change
+            // in the local description or stream has occurred.
+            peerConnection.onnegotiationneeded = () => {
+                // This will typically only fire for the first peer that joins (the Initiator)
+                if (isInitiator) {
+                   createOffer();
+                }
+            };
+        }
+
+        // --- WebRTC Signaling Handlers (via Socket.io) ---
+
+        socket.on('connect', () => {
+            setStatus('Connected to Signaling Server. Click Connect.', 'info');
+        });
+
+        socket.on('newPeerReady', () => {
+             // If a second peer joins, and we are already initialized, we become the initiator
+             // to ensure a connection is attempted.
+             if (peerConnection) {
+                 isInitiator = true;
+                 createOffer();
+                 setStatus('New peer detected. Initiating call...', 'info');
+             }
+        });
+
+        socket.on('signal', async (message) => {
+            if (!peerConnection) return;
+
+            try {
+                if (message.offer) {
+                    // Received an Offer from the Initiator
+                    setStatus('Received Offer. Answering call...', 'info');
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    socket.emit('signal', { 'answer': peerConnection.localDescription });
+
+                } else if (message.answer) {
+                    // Received an Answer from the Responder
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+                    setStatus('Connection established! Waiting for audio.', 'success');
+
+                } else if (message.ice) {
+                    // Received an ICE candidate
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(message.ice));
+                }
+            } catch (e) {
+                console.error("Error processing signal:", e);
+            }
+        });
+        
+        // --- SDP Offer/Answer Creation ---
+
+        async function createOffer() {
+            try {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                // Send the Offer over the signaling server
+                socket.emit('signal', { 'offer': peerConnection.localDescription });
+            } catch (e) {
+                console.error('Error creating offer:', e);
+            }
+        }
+
+    </script>
+</body>
+</html>
